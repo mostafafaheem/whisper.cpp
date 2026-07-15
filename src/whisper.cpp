@@ -971,7 +971,8 @@ static bool whisper_kv_cache_init(
                            ggml_type   wtype,
                              int64_t   n_text_state,
                              int64_t   n_text_layer,
-                                 int   n_ctx) {
+                                 int   n_ctx,
+                          const char * tag) {
     const int64_t n_mem      = n_text_layer*n_ctx;
     const int64_t n_elements = n_text_state*n_mem;
 
@@ -998,6 +999,11 @@ static bool whisper_kv_cache_init(
 
     cache.k = ggml_new_tensor_1d(ctx, wtype, n_elements);
     cache.v = ggml_new_tensor_1d(ctx, wtype, n_elements);
+
+    if (tag) {
+        ggml_set_name(cache.k, (std::string(tag) + "_k").c_str());
+        ggml_set_name(cache.v, (std::string(tag) + "_v").c_str());
+    }
 
     cache.buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!cache.buffer) {
@@ -2304,7 +2310,7 @@ static struct ggml_cgraph * whisper_build_graph_cross(
                 layer.cross_attn_k_w,
                 cur);
 
-        Kcross = ggml_scale(ctx0, Kcross, Kscale);
+        // Kcross = ggml_scale(ctx0, Kcross, Kscale);
 
         struct ggml_tensor * Vcross = ggml_mul_mat(ctx0,
                 layer.cross_attn_v_w,
@@ -3387,7 +3393,8 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
     if (!whisper_kv_cache_init(state->kv_self, state->backends[0], ctx->itype,
                 ctx->model.hparams.n_text_state,
                 ctx->model.hparams.n_text_layer,
-                GGML_PAD(ctx->model.hparams.n_text_ctx, 256))) {
+                GGML_PAD(ctx->model.hparams.n_text_ctx, 256),
+                "kv_self")) {
         WHISPER_LOG_ERROR("%s: whisper_kv_cache_init() failed for self-attention cache\n", __func__);
         whisper_free_state(state);
         return nullptr;
@@ -3401,7 +3408,8 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
     if (!whisper_kv_cache_init(state->kv_cross, state->backends[0], ctx->itype,
                 ctx->model.hparams.n_text_state,
                 ctx->model.hparams.n_text_layer,
-                GGML_PAD(ctx->model.hparams.n_audio_ctx, 256))) {
+                GGML_PAD(ctx->model.hparams.n_audio_ctx, 256),
+                "kv_cross")) {
         WHISPER_LOG_ERROR("%s: whisper_kv_cache_init() failed for cross-attention cache\n", __func__);
         whisper_free_state(state);
         return nullptr;
@@ -3415,7 +3423,8 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
     if (!whisper_kv_cache_init(state->kv_pad, state->backends[0], ctx->itype,
                 ctx->model.hparams.n_audio_state,
                 1,
-                GGML_PAD(ctx->model.hparams.n_audio_ctx, 256))) {
+                GGML_PAD(ctx->model.hparams.n_audio_ctx, 256),
+                "kv_pad")) {
         WHISPER_LOG_ERROR("%s: whisper_kv_cache_init() failed for self-attention cache\n", __func__);
         whisper_free_state(state);
         return nullptr;
@@ -7151,7 +7160,8 @@ int whisper_full_with_state(
                     if (!whisper_kv_cache_init(state->kv_self, state->backends[0], ctx->itype,
                                 ctx->model.hparams.n_text_state,
                                 ctx->model.hparams.n_text_layer,
-                                GGML_PAD(ctx->model.hparams.n_text_ctx, 256)*factor)) {
+                                GGML_PAD(ctx->model.hparams.n_text_ctx, 256)*factor,
+                                "kv_self")) {
                         WHISPER_LOG_ERROR("%s: whisper_kv_cache_init() failed for self-attention cache\n", __func__);
                         whisper_free_state(state);
                         return -7;

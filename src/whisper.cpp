@@ -4,6 +4,10 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "ggml-alloc.h"
+
+#include <iomanip>
+#include <iostream>
+
 #include "ggml-backend.h"
 
 #ifdef WHISPER_USE_COREML
@@ -18,6 +22,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cstdlib>
 #define _USE_MATH_DEFINES
 #include <cmath>
 #include <climits>
@@ -187,6 +192,58 @@ static bool ggml_graph_compute_helper(
     return ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS;
 }
 
+static void whisper_print_tensor_stats(const struct ggml_tensor * t, const char * name) {
+    if (t == nullptr || t->data == nullptr) {
+        return;
+    }
+
+    int64_t size = ggml_nelements(t);
+    if (size == 0) {
+        return;
+    }
+
+    float first = 0.0f;
+    float min_val = 0.0f;
+    float max_val = 0.0f;
+    double sum = 0.0;
+
+    auto get_value = [&](int64_t i) -> float {
+        if (t->type == GGML_TYPE_F32) {
+            return ((const float *)t->data)[i];
+        } else if (t->type == GGML_TYPE_F16) {
+            return ggml_fp16_to_fp32(((const ggml_fp16_t *)t->data)[i]);
+        }
+        return 0.0f;
+    };
+
+    if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) {
+        first = get_value(0);
+        min_val = first;
+        max_val = first;
+        sum = first;
+
+        for (int64_t i = 1; i < size; ++i) {
+            float v = get_value(i);
+            if (v < min_val) min_val = v;
+            if (v > max_val) max_val = v;
+            sum += v;
+        }
+        double mean = sum / size;
+
+        char second_str[16];
+        if (size > 1) {
+            snprintf(second_str, sizeof(second_str), "%12.6f", get_value(1));
+        } else {
+            snprintf(second_str, sizeof(second_str), "%12s", "N/A");
+        }
+        float last = get_value(size - 1);
+
+        fprintf(stderr, "[WHISPER-TENSOR-DBG] Name: %-30s | Shape: [%4d,%4d,%4d,%4d] | Type: %s | First: %12.6f | Second: %s | Last: %12.6f | Min: %12.6f | Max: %12.6f | Mean: %12.6f\n",
+                name, (int)t->ne[0], (int)t->ne[1], (int)t->ne[2], (int)t->ne[3],
+                ggml_type_name(t->type), first, second_str, last, min_val, max_val, mean);
+    }
+}
+
 static bool ggml_graph_compute_helper(
       ggml_backend_sched_t   sched,
         struct ggml_cgraph * graph,
@@ -203,7 +260,55 @@ static bool ggml_graph_compute_helper(
         }
     }
 
+    const char * env_dbg = getenv("WHISPER_DEBUG_TENSORS");
+    auto should_print = [&](const char * name) -> bool {
+        if (!name || strlen(name) == 0) return false;
+        if (strcmp(env_dbg, "1") == 0 || strcmp(env_dbg, "all") == 0) return true;
+        std::string s_filter(env_dbg);
+        std::string s_name(name);
+        size_t pos = 0;
+        while (true) {
+            size_t next_pos = s_filter.find(',', pos);
+            std::string part = s_filter.substr(pos, next_pos - pos);
+            if (!part.empty() && s_name.find(part) != std::string::npos) {
+                return true;
+            }
+            if (next_pos == std::string::npos) break;
+            pos = next_pos + 1;
+        }
+        return false;
+    };
+
+    if (env_dbg && strlen(env_dbg) > 0) {
+        std::set<const struct ggml_tensor *> printed;
+        int n_nodes = ggml_graph_n_nodes(graph);
+        for (int i = 0; i < n_nodes; ++i) {
+            struct ggml_tensor * t = ggml_graph_node(graph, i);
+            if (t) {
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    struct ggml_tensor * src = t->src[j];
+                    if (src && printed.find(src) == printed.end() && should_print(src->name)) {
+                        whisper_print_tensor_stats(src, src->name);
+                        printed.insert(src);
+                    }
+                }
+            }
+        }
+    }
+
     const bool t = (ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+
+    if (t && env_dbg && strlen(env_dbg) > 0) {
+        std::set<const struct ggml_tensor *> printed;
+        int n_nodes = ggml_graph_n_nodes(graph);
+        for (int i = 0; i < n_nodes; ++i) {
+            struct ggml_tensor * node = ggml_graph_node(graph, i);
+            if (node && printed.find(node) == printed.end() && should_print(node->name)) {
+                whisper_print_tensor_stats(node, node->name);
+                printed.insert(node);
+            }
+        }
+    }
 
     if (!t || sched_reset) {
         ggml_backend_sched_reset(sched);
@@ -2145,6 +2250,8 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
                         0, 2, 1, 3);
 
             if (wctx.params.flash_attn) {
+                // fprintf(stderr, "[KV-OFFSET-DBG] whisper.cpp: encoder_self_attn | layer: %d | direction: write | k_offset_bytes: 0 | k_offset_tokens: 0\n", il);
+                // fprintf(stderr, "[KV-OFFSET-DBG] whisper.cpp: encoder_self_attn | layer: %d | direction: write | v_offset_bytes: 0 | v_offset_tokens: 0\n", il);
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, ggml_view_1d(ctx0, kv_pad.k, n_ctx*n_state, 0)));
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, ggml_view_1d(ctx0, kv_pad.v, n_ctx*n_state, 0)));
 
@@ -2162,6 +2269,8 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
                             ggml_element_size(kv_pad.v)*n_state_head,
                             0);
 
+                // fprintf(stderr, "[KV-OFFSET-DBG] whisper.cpp: encoder_self_attn | layer: %d | direction: read | k_offset_bytes: 0 | k_offset_tokens: 0\n", il);
+                // fprintf(stderr, "[KV-OFFSET-DBG] whisper.cpp: encoder_self_attn | layer: %d | direction: read | v_offset_bytes: 0 | v_offset_tokens: 0\n", il);
                 cur = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, KQscale, 0.0f, 0.0f);
 
                 cur = ggml_reshape_2d(ctx0, cur, n_state, n_ctx);
@@ -2270,7 +2379,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
     //        wstate.get_buf_max_mem(3)/1e6);
 
     ggml_free(ctx0);
-
+    // ggml_graph_dump_dot(gf, nullptr, "graph_encoder.dot");
     return gf;
 }
 
@@ -2347,6 +2456,7 @@ static struct ggml_cgraph * whisper_build_graph_cross(
     //ggml_graph_print(gf);
 
     ggml_free(ctx0);
+    // ggml_graph_dump_dot(gf, nullptr, "graph_cross.dot");
 
     return gf;
 }
@@ -2436,6 +2546,63 @@ static bool whisper_encode_internal(
 
         if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
             return false;
+        }
+
+        // DEBUG: dump first 10 elements of embd_enc
+        {
+            const int64_t nelements = ggml_nelements(wstate.embd_enc);
+            std::vector<float> embd_data(nelements);
+            ggml_backend_tensor_get(wstate.embd_enc, embd_data.data(), 0, nelements * sizeof(float));
+            fprintf(stderr, "[ENCODER_DBG] first 10 elements: ");
+            for (int k = 0; k < std::min<int64_t>(10, nelements); ++k) {
+                fprintf(stderr, "%.6f ", embd_data[k]);
+            }
+            fprintf(stderr, "\n");
+            const char * save_path = std::getenv("WHISPER_SAVE_EMBD");
+            if (save_path != nullptr) {
+                FILE * f = fopen(save_path, "wb");
+                if (f != nullptr) {
+                    fwrite(embd_data.data(), sizeof(float), nelements, f);
+                    fclose(f);
+                    fprintf(stderr, "[ENCODER_DBG] Saved encoder output tensor to %s (%d elements)\n", save_path, (int)nelements);
+                } else {
+                    fprintf(stderr, "[ENCODER_DBG] Failed to open %s for saving\n", save_path);
+                }
+            }
+            const char * compare_path = std::getenv("WHISPER_COMPARE_EMBD");
+            if (compare_path != nullptr) {
+                FILE * f = fopen(compare_path, "rb");
+                if (f != nullptr) {
+                    std::vector<float> ref_data(nelements);
+                    size_t read_elements = fread(ref_data.data(), sizeof(float), nelements, f);
+                    fclose(f);
+                    if (read_elements != (size_t)nelements) {
+                        fprintf(stderr, "[ENCODER_DBG] WARNING: Reference file %s has %zu elements, but expected %d elements\n",
+                                compare_path, read_elements, (int)nelements);
+                    } else {
+                        double dot = 0.0;
+                        double norm_a = 0.0;
+                        double norm_b = 0.0;
+                        double max_diff = 0.0;
+                        for (int64_t i = 0; i < nelements; ++i) {
+                            double a = embd_data[i];
+                            double b = ref_data[i];
+                            dot += a * b;
+                            norm_a += a * a;
+                            norm_b += b * b;
+                            double diff = std::abs(a - b);
+                            if (diff > max_diff) {
+                                max_diff = diff;
+                            }
+                        }
+                        double cosine_similarity = (norm_a > 0.0 && norm_b > 0.0) ? (dot / (std::sqrt(norm_a) * std::sqrt(norm_b))) : 0.0;
+                        fprintf(stderr, "[ENCODER_DBG] Cosine similarity: %.8f, Max diff: %.8f (relative to %s)\n",
+                                cosine_similarity, max_diff, compare_path);
+                    }
+                } else {
+                    fprintf(stderr, "[ENCODER_DBG] Failed to open %s for comparison\n", compare_path);
+                }
+            }
         }
     }
 
@@ -2530,6 +2697,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers_decoder[il];
+        const std::string layer_prefix = "dbg_layer_" + std::to_string(il);
 
         // norm
         {
@@ -2541,6 +2709,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                         cur,
                         layer.attn_ln_0_w),
                     layer.attn_ln_0_b);
+            ggml_set_name(cur, (layer_prefix + "_ln0").c_str());
         }
 
         // self-attention
@@ -2554,6 +2723,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                         layer.attn_q_b);
 
             Qcur = ggml_scale(ctx0, Qcur, KQscale);
+            ggml_set_name(Qcur, (layer_prefix + "_self_q").c_str());
 
             // note: no bias for Key
             struct ggml_tensor * Kcur = ggml_mul_mat(ctx0,
@@ -2561,6 +2731,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                     cur);
 
             Kcur = ggml_scale(ctx0, Kcur, KQscale);
+            ggml_set_name(Kcur, (layer_prefix + "_self_k").c_str());
 
             // store key and value to memory
             {
@@ -2571,6 +2742,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                 Vcur = ggml_add(ctx0,
                             Vcur,
                             layer.attn_v_b);
+                ggml_set_name(Vcur, (layer_prefix + "_self_v").c_str());
 
                 struct ggml_tensor * k;
                 struct ggml_tensor * v;
@@ -2581,6 +2753,10 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
 
                     v = ggml_view_1d(ctx0, kv_self.v, n_tokens*n_state,
                             (ggml_element_size(kv_self.v)*n_state)*(il*n_ctx + kv_head));
+                    // fprintf(stderr, "[KV-OFFSET-DBG] whisper.cpp: decoder_self_attn | layer: %d | direction: write | k_offset_bytes: %zu | k_offset_tokens: %d\n",
+                            // il, (size_t)((ggml_element_size(kv_self.k)*n_state)*(il*n_ctx + kv_head)), il*n_ctx + kv_head);
+                    // fprintf(stderr, "[KV-OFFSET-DBG] whisper.cpp: decoder_self_attn | layer: %d | direction: write | v_offset_bytes: %zu | v_offset_tokens: %d\n",
+                            // il, (size_t)((ggml_element_size(kv_self.v)*n_state)*(il*n_ctx + kv_head)), il*n_ctx + kv_head);
                 } else {
                     Vcur = ggml_transpose(ctx0, ggml_reshape_2d(ctx0, Vcur, n_state, n_tokens));
 
@@ -2618,9 +2794,15 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                             ggml_element_size(kv_self.v)*n_state_head,
                             ggml_element_size(kv_self.v)*n_state*n_ctx*il);
 
+                // fprintf(stderr, "[KV-OFFSET-DBG] whisper.cpp: decoder_self_attn | layer: %d | direction: read | k_offset_bytes: %zu | k_offset_tokens: %d\n",
+                //         il, (size_t)(ggml_element_size(kv_self.k)*n_state*n_ctx*il), il*n_ctx);
+                // fprintf(stderr, "[KV-OFFSET-DBG] whisper.cpp: decoder_self_attn | layer: %d | direction: read | v_offset_bytes: %zu | v_offset_tokens: %d\n",
+                //         il, (size_t)(ggml_element_size(kv_self.v)*n_state*n_ctx*il), il*n_ctx);
+
                 cur = ggml_flash_attn_ext(ctx0, Q, K, V, KQ_mask_f16, 1.0f, 0.0f, 0.0f);
 
                 cur = ggml_reshape_2d(ctx0, cur, n_state, n_tokens);
+                ggml_set_name(cur, (layer_prefix + "_self_attn_out").c_str());
             } else {
                 // K * Q
                 struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
@@ -2639,6 +2821,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                 struct ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
 
                 cur = ggml_cont_2d(ctx0, KQV_merged, n_state, n_tokens);
+                ggml_set_name(cur, (layer_prefix + "_self_attn_out").c_str());
             }
         }
 
@@ -2651,10 +2834,12 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
             cur = ggml_add(ctx0,
                     cur,
                     layer.attn_ln_1_b);
+            ggml_set_name(cur, (layer_prefix + "_self_proj").c_str());
         }
 
         // add the input
         struct ggml_tensor * inpCA = ggml_add(ctx0, cur, inpL);
+        ggml_set_name(inpCA, (layer_prefix + "_self_res").c_str());
 
         // norm
         {
@@ -2666,6 +2851,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                         cur,
                         layer.cross_attn_ln_0_w),
                     layer.cross_attn_ln_0_b);
+            ggml_set_name(cur, (layer_prefix + "_cross_ln0").c_str());
         }
 
         // cross-attention
@@ -2677,11 +2863,13 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
             Qcur = ggml_add(ctx0,
                         Qcur,
                         layer.cross_attn_q_b);
+            ggml_set_name(Qcur, (layer_prefix + "_cross_q").c_str());
 
             struct ggml_tensor * Q =
                 ggml_permute(ctx0,
                         ggml_reshape_3d(ctx0, Qcur, n_state_head, n_head, n_tokens),
                         0, 2, 1, 3);
+            ggml_set_name(Q, ("dbg_Q_cross_layer_" + std::to_string(il)).c_str());
 
             if (wctx.params.flash_attn) {
                 struct ggml_tensor * Kcross =
@@ -2701,6 +2889,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                 cur = ggml_flash_attn_ext(ctx0, Q, Kcross, Vcross, nullptr, KQscale, 0.0f, 0.0f);
 
                 cur = ggml_reshape_2d(ctx0, cur, n_state, n_tokens);
+                ggml_set_name(cur, (layer_prefix + "_cross_attn_out").c_str());
             } else {
                 struct ggml_tensor * Kcross =
                     ggml_view_3d(ctx0, wstate.kv_cross.k,
@@ -2746,6 +2935,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                 struct ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
 
                 cur = ggml_cont_2d(ctx0, KQV_merged, n_state, n_tokens);
+                ggml_set_name(cur, (layer_prefix + "_cross_attn_out").c_str());
             }
         }
 
@@ -2758,10 +2948,12 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
             cur = ggml_add(ctx0,
                     cur,
                     layer.cross_attn_ln_1_b);
+            ggml_set_name(cur, (layer_prefix + "_cross_proj").c_str());
         }
 
         // add the input
         cur = ggml_add(ctx0, cur, inpCA);
+        ggml_set_name(cur, (layer_prefix + "_cross_res").c_str());
 
         struct ggml_tensor * inpFF = cur;
 
@@ -2777,6 +2969,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                             cur,
                             layer.mlp_ln_w),
                         layer.mlp_ln_b);
+                ggml_set_name(cur, (layer_prefix + "_mlp_ln").c_str());
             }
 
             // fully connected
@@ -2787,9 +2980,11 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
             cur = ggml_add(ctx0,
                     cur,
                     layer.mlp_0_b);
+            ggml_set_name(cur, (layer_prefix + "_mlp_0").c_str());
 
             // GELU activation
             cur = ggml_gelu(ctx0, cur);
+            ggml_set_name(cur, (layer_prefix + "_mlp_gelu").c_str());
 
             // projection
             cur = ggml_mul_mat(ctx0,
@@ -2799,9 +2994,11 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
             cur = ggml_add(ctx0,
                     cur,
                     layer.mlp_1_b);
+            ggml_set_name(cur, (layer_prefix + "_mlp_1").c_str());
         }
 
         inpL = ggml_add(ctx0, cur, inpFF);
+        ggml_set_name(inpL, (layer_prefix + "_mlp_res").c_str());
     }
 
     cur = inpL;
@@ -2815,6 +3012,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                     cur,
                     model.d_ln_w),
                 model.d_ln_b);
+        ggml_set_name(cur, "dbg_final_ln");
     }
 
     // compute logits only for the last token
@@ -2823,6 +3021,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
     //cur = ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], (cur->ne[1] - 1)*cur->nb[1]);
 
     struct ggml_tensor * logits = ggml_mul_mat(ctx0, model.d_te, cur);
+    ggml_set_name(logits, "dbg_logits");
 
     // [EXPERIMENTAL] Token-level timestamps with DTW
     if (wctx.params.dtw_token_timestamps && aheads_cross_QKs != nullptr) {
@@ -2837,7 +3036,8 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
     ggml_build_forward_expand(gf, logits);
 
     ggml_free(ctx0);
-
+    // ggml_graph_dump_dot(gf, nullptr, "graph_decoder.dot");
+    //WHISPER_LOG_INFO("DECODING");
     return gf;
 }
 
@@ -2943,12 +3143,427 @@ static bool whisper_decode_internal(
             }
 
             ggml_backend_tensor_set(KQ_mask, wstate.inp_mask.data(), 0, ggml_nelements(KQ_mask)*sizeof(float));
+
+            const char * env_dbg_mask = getenv("WHISPER_DEBUG_ATTN_MASK");
+            if (env_dbg_mask && strlen(env_dbg_mask) > 0) {
+                fprintf(stderr, "[WHISPER-TENSOR-DBG] KQ_mask elements (n_tokens=%d, n_kv=%d):\n", n_tokens, n_kv);
+                for (int j = 0; j < n_tokens; ++j) {
+                    fprintf(stderr, "  token %d: ", j);
+                    for (int i = 0; i < n_kv; ++i) {
+                        float val = data[j * n_kv + i];
+                        if (val == -INFINITY) {
+                            fprintf(stderr, "-inf ");
+                        } else {
+                            fprintf(stderr, "%.1f ", val);
+                        }
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
         }
 
         logits = ggml_graph_node(gf, -1);
 
+        struct callback_context {
+            bool is_first_decode;
+            bool enable_dbg_qkv;
+        };
+        callback_context cb_ctx = {
+            batch.n_tokens > 1,
+            getenv("WHISPER_DEBUG_QKV") != nullptr
+        };
+
+        auto debug_eval_callback = [](struct ggml_tensor * t, bool ask, void * user_data) -> bool {
+            auto * ctx = (callback_context *)user_data;
+            if (!ctx->is_first_decode) {
+                return false;
+            }
+            if (ask) {
+                return true;
+            }
+
+            // Handle Q debug prints immediately during execution callback before memory reuse
+            if (ctx->enable_dbg_qkv && (strncmp(t->name, "dbg_Q_layer_", 12) == 0 || strncmp(t->name, "dbg_Q_cross_layer_", 18) == 0)) {
+                size_t q_elements = ggml_nelements(t);
+                size_t q_bytes = ggml_nbytes(t);
+                std::vector<char> q_data(q_bytes);
+                ggml_backend_tensor_get(t, q_data.data(), 0, q_bytes);
+
+                double q_min = INFINITY;
+                double q_max = -INFINITY;
+                double q_sum = 0.0;
+                size_t count = 0;
+
+                if (t->type == GGML_TYPE_F32) {
+                    const float * ptr = (const float *)q_data.data();
+                    for (size_t i = 0; i < q_elements; ++i) {
+                        float val = ptr[i];
+                        if (val < q_min) q_min = val;
+                        if (val > q_max) q_max = val;
+                        q_sum += val;
+                        count++;
+                    }
+                } else if (t->type == GGML_TYPE_F16) {
+                    const ggml_fp16_t * ptr = (const ggml_fp16_t *)q_data.data();
+                    for (size_t i = 0; i < q_elements; ++i) {
+                        float val = ggml_fp16_to_fp32(ptr[i]);
+                        if (val < q_min) q_min = val;
+                        if (val > q_max) q_max = val;
+                        q_sum += val;
+                        count++;
+                    }
+                }
+
+                float first_0 = 0.0f, first_1 = 0.0f;
+                float last_0 = 0.0f, last_1 = 0.0f;
+                if (q_elements >= 2) {
+                    if (t->type == GGML_TYPE_F32) {
+                        const float * ptr = (const float *)q_data.data();
+                        first_0 = ptr[0];
+                        first_1 = ptr[1];
+                        last_0 = ptr[q_elements - 2];
+                        last_1 = ptr[q_elements - 1];
+                    } else if (t->type == GGML_TYPE_F16) {
+                        const ggml_fp16_t * ptr = (const ggml_fp16_t *)q_data.data();
+                        first_0 = ggml_fp16_to_fp32(ptr[0]);
+                        first_1 = ggml_fp16_to_fp32(ptr[1]);
+                        last_0 = ggml_fp16_to_fp32(ptr[q_elements - 2]);
+                        last_1 = ggml_fp16_to_fp32(ptr[q_elements - 1]);
+                    }
+                }
+
+                if (count > 0) {
+                    const bool is_cross = strncmp(t->name, "dbg_Q_cross_layer_", 18) == 0;
+                    int layer_idx = atoi(t->name + (is_cross ? 18 : 12));
+                    fprintf(stderr, "[QKV-DBG] Layer %d | %s shape: [%ld,%ld,%ld,%ld] | stats: Min = %f, Max = %f, Mean = %f | First 2: %f %f, Last 2: %f %f\n",
+                            layer_idx, is_cross ? "Qcross" : "Q", t->ne[0], t->ne[1], t->ne[2], t->ne[3], q_min, q_max, q_sum / count, first_0, first_1, last_0, last_1);
+                }
+                return true;
+            }
+
+            // Handle Attention Output debug prints immediately during execution callback before memory reuse
+            if (ctx->enable_dbg_qkv && strncmp(t->name, "dbg_layer_", 10) == 0 &&
+                (strstr(t->name, "_self_attn_out") != nullptr || strstr(t->name, "_cross_attn_out") != nullptr)) {
+                size_t elements = ggml_nelements(t);
+                size_t bytes = ggml_nbytes(t);
+                std::vector<char> data(bytes);
+                ggml_backend_tensor_get(t, data.data(), 0, bytes);
+
+                double min_val = INFINITY;
+                double max_val = -INFINITY;
+                double sum = 0.0;
+                size_t count = 0;
+
+                if (t->type == GGML_TYPE_F32) {
+                    const float * ptr = (const float *)data.data();
+                    for (size_t i = 0; i < elements; ++i) {
+                        float val = ptr[i];
+                        if (val < min_val) min_val = val;
+                        if (val > max_val) max_val = val;
+                        sum += val;
+                        count++;
+                    }
+                } else if (t->type == GGML_TYPE_F16) {
+                    const ggml_fp16_t * ptr = (const ggml_fp16_t *)data.data();
+                    for (size_t i = 0; i < elements; ++i) {
+                        float val = ggml_fp16_to_fp32(ptr[i]);
+                        if (val < min_val) min_val = val;
+                        if (val > max_val) max_val = val;
+                        sum += val;
+                        count++;
+                    }
+                }
+
+                float first_0 = 0.0f, first_1 = 0.0f;
+                float last_0 = 0.0f, last_1 = 0.0f;
+                if (elements >= 2) {
+                    if (t->type == GGML_TYPE_F32) {
+                        const float * ptr = (const float *)data.data();
+                        first_0 = ptr[0];
+                        first_1 = ptr[1];
+                        last_0 = ptr[elements - 2];
+                        last_1 = ptr[elements - 1];
+                    } else if (t->type == GGML_TYPE_F16) {
+                        const ggml_fp16_t * ptr = (const ggml_fp16_t *)data.data();
+                        first_0 = ggml_fp16_to_fp32(ptr[0]);
+                        first_1 = ggml_fp16_to_fp32(ptr[1]);
+                        last_0 = ggml_fp16_to_fp32(ptr[elements - 2]);
+                        last_1 = ggml_fp16_to_fp32(ptr[elements - 1]);
+                    }
+                }
+
+                if (count > 0) {
+                    const bool is_cross = strstr(t->name, "_cross_attn_out") != nullptr;
+                    int layer_idx = atoi(t->name + 10);
+                    fprintf(stderr, "[QKV-DBG] Layer %d | %s shape: [%ld,%ld,%ld,%ld] | stats: Min = %f, Max = %f, Mean = %f | First 2: %f %f, Last 2: %f %f\n",
+                            layer_idx, is_cross ? "CrossAttnOut" : "AttnOut", t->ne[0], t->ne[1], t->ne[2], t->ne[3], min_val, max_val, sum / count, first_0, first_1, last_0, last_1);
+                }
+                return true;
+            }
+
+            return true;
+        };
+
+        const bool enable_debug = getenv("GGML_CPU_DEBUG_DEC") != nullptr;
+        const bool enable_dbg_qkv = cb_ctx.enable_dbg_qkv;
+        if (enable_debug || enable_dbg_qkv) {
+            ggml_backend_sched_set_eval_callback(sched, debug_eval_callback, &cb_ctx);
+        }
+
         if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+            if (enable_debug || enable_dbg_qkv) {
+                ggml_backend_sched_set_eval_callback(sched, nullptr, nullptr);
+            }
             return false;
+        }
+
+        if (enable_debug || enable_dbg_qkv) {
+            ggml_backend_sched_set_eval_callback(sched, nullptr, nullptr);
+        }
+
+        const char * env_dbg_qkv = getenv("WHISPER_DEBUG_QKV");
+        if (env_dbg_qkv && strlen(env_dbg_qkv) > 0) {
+            auto & kv_self = wstate.kv_self;
+            const int n_ctx = kv_self.size;
+            const int n_state = hparams.n_text_state;
+            const int n_layer = hparams.n_text_layer;
+            const int n_kv = kv_self.n;
+
+            const int n_audio_ctx = wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx : hparams.n_audio_ctx;
+            const int n_audio_ctx_pad = GGML_PAD(n_audio_ctx, 256);
+
+            for (int il = 0; il < n_layer; ++il) {
+
+                // Read and print stats for K
+                if (kv_self.k) {
+                    size_t k_layer_offset = ggml_element_size(kv_self.k) * n_state * n_ctx * il;
+                    size_t size_bytes = ggml_element_size(kv_self.k) * n_state * n_kv;
+                    std::vector<char> k_layer_data(size_bytes);
+                    ggml_backend_tensor_get(kv_self.k, k_layer_data.data(), k_layer_offset, size_bytes);
+
+                    double k_min = INFINITY;
+                    double k_max = -INFINITY;
+                    double k_sum = 0.0;
+                    size_t count = 0;
+                    size_t k_elements = n_state * n_kv;
+
+                    if (kv_self.k->type == GGML_TYPE_F32) {
+                        const float * ptr = (const float *)k_layer_data.data();
+                        for (size_t i = 0; i < k_elements; ++i) {
+                            float val = ptr[i];
+                            if (val < k_min) k_min = val;
+                            if (val > k_max) k_max = val;
+                            k_sum += val;
+                            count++;
+                        }
+                    } else if (kv_self.k->type == GGML_TYPE_F16) {
+                        const ggml_fp16_t * ptr = (const ggml_fp16_t *)k_layer_data.data();
+                        for (size_t i = 0; i < k_elements; ++i) {
+                            float val = ggml_fp16_to_fp32(ptr[i]);
+                            if (val < k_min) k_min = val;
+                            if (val > k_max) k_max = val;
+                            k_sum += val;
+                            count++;
+                        }
+                    }
+
+                    float first_0 = 0.0f, first_1 = 0.0f;
+                    float last_0 = 0.0f, last_1 = 0.0f;
+                    if (k_elements >= 2) {
+                        if (kv_self.k->type == GGML_TYPE_F32) {
+                            const float * ptr = (const float *)k_layer_data.data();
+                            first_0 = ptr[0];
+                            first_1 = ptr[1];
+                            last_0 = ptr[k_elements - 2];
+                            last_1 = ptr[k_elements - 1];
+                        } else if (kv_self.k->type == GGML_TYPE_F16) {
+                            const ggml_fp16_t * ptr = (const ggml_fp16_t *)k_layer_data.data();
+                            first_0 = ggml_fp16_to_fp32(ptr[0]);
+                            first_1 = ggml_fp16_to_fp32(ptr[1]);
+                            last_0 = ggml_fp16_to_fp32(ptr[k_elements - 2]);
+                            last_1 = ggml_fp16_to_fp32(ptr[k_elements - 1]);
+                        }
+                    }
+
+                    if (count > 0) {
+                        fprintf(stderr, "[QKV-DBG] Layer %d | K slice elements: %zu | stats: Min = %f, Max = %f, Mean = %f | First 2: %f %f, Last 2: %f %f\n",
+                                il, k_elements, k_min, k_max, k_sum / count, first_0, first_1, last_0, last_1);
+                    }
+                }
+
+                // Read and print stats for V
+                if (kv_self.v) {
+                    size_t v_layer_offset = ggml_element_size(kv_self.v) * n_state * n_ctx * il;
+                    size_t size_bytes = ggml_element_size(kv_self.v) * n_state * n_kv;
+                    std::vector<char> v_layer_data(size_bytes);
+                    ggml_backend_tensor_get(kv_self.v, v_layer_data.data(), v_layer_offset, size_bytes);
+
+                    double v_min = INFINITY;
+                    double v_max = -INFINITY;
+                    double v_sum = 0.0;
+                    size_t count = 0;
+                    size_t v_elements = n_state * n_kv;
+
+                    if (kv_self.v->type == GGML_TYPE_F32) {
+                        const float * ptr = (const float *)v_layer_data.data();
+                        for (size_t i = 0; i < v_elements; ++i) {
+                            float val = ptr[i];
+                            if (val < v_min) v_min = val;
+                            if (val > v_max) v_max = val;
+                            v_sum += val;
+                            count++;
+                        }
+                    } else if (kv_self.v->type == GGML_TYPE_F16) {
+                        const ggml_fp16_t * ptr = (const ggml_fp16_t *)v_layer_data.data();
+                        for (size_t i = 0; i < v_elements; ++i) {
+                            float val = ggml_fp16_to_fp32(ptr[i]);
+                            if (val < v_min) v_min = val;
+                            if (val > v_max) v_max = val;
+                            v_sum += val;
+                            count++;
+                        }
+                    }
+
+                    float first_0 = 0.0f, first_1 = 0.0f;
+                    float last_0 = 0.0f, last_1 = 0.0f;
+                    if (v_elements >= 2) {
+                        if (kv_self.v->type == GGML_TYPE_F32) {
+                            const float * ptr = (const float *)v_layer_data.data();
+                            first_0 = ptr[0];
+                            first_1 = ptr[1];
+                            last_0 = ptr[v_elements - 2];
+                            last_1 = ptr[v_elements - 1];
+                        } else if (kv_self.v->type == GGML_TYPE_F16) {
+                            const ggml_fp16_t * ptr = (const ggml_fp16_t *)v_layer_data.data();
+                            first_0 = ggml_fp16_to_fp32(ptr[0]);
+                            first_1 = ggml_fp16_to_fp32(ptr[1]);
+                            last_0 = ggml_fp16_to_fp32(ptr[v_elements - 2]);
+                            last_1 = ggml_fp16_to_fp32(ptr[v_elements - 1]);
+                        }
+                    }
+
+                    if (count > 0) {
+                        fprintf(stderr, "[QKV-DBG] Layer %d | V slice elements: %zu | stats: Min = %f, Max = %f, Mean = %f | First 2: %f %f, Last 2: %f %f\n",
+                                il, v_elements, v_min, v_max, v_sum / count, first_0, first_1, last_0, last_1);
+                    }
+                }
+
+                // Read and print stats for Kcross
+                if (wstate.kv_cross.k) {
+                    const int n_ctx_cross = wctx.params.flash_attn ? n_audio_ctx_pad : n_audio_ctx;
+                    size_t k_layer_offset = ggml_element_size(wstate.kv_cross.k) * n_state * n_ctx_cross * il;
+                    size_t size_bytes = ggml_element_size(wstate.kv_cross.k) * n_state * n_ctx_cross;
+                    std::vector<char> k_layer_data(size_bytes);
+                    ggml_backend_tensor_get(wstate.kv_cross.k, k_layer_data.data(), k_layer_offset, size_bytes);
+
+                    double k_min = INFINITY;
+                    double k_max = -INFINITY;
+                    double k_sum = 0.0;
+                    size_t count = 0;
+                    size_t k_elements = n_state * n_ctx_cross;
+
+                    if (wstate.kv_cross.k->type == GGML_TYPE_F32) {
+                        const float * ptr = (const float *)k_layer_data.data();
+                        for (size_t i = 0; i < k_elements; ++i) {
+                            float val = ptr[i];
+                            if (val < k_min) k_min = val;
+                            if (val > k_max) k_max = val;
+                            k_sum += val;
+                            count++;
+                        }
+                    } else if (wstate.kv_cross.k->type == GGML_TYPE_F16) {
+                        const ggml_fp16_t * ptr = (const ggml_fp16_t *)k_layer_data.data();
+                        for (size_t i = 0; i < k_elements; ++i) {
+                            float val = ggml_fp16_to_fp32(ptr[i]);
+                            if (val < k_min) k_min = val;
+                            if (val > k_max) k_max = val;
+                            k_sum += val;
+                            count++;
+                        }
+                    }
+
+                    float first_0 = 0.0f, first_1 = 0.0f;
+                    float last_0 = 0.0f, last_1 = 0.0f;
+                    if (k_elements >= 2) {
+                        if (wstate.kv_cross.k->type == GGML_TYPE_F32) {
+                            const float * ptr = (const float *)k_layer_data.data();
+                            first_0 = ptr[0];
+                            first_1 = ptr[1];
+                            last_0 = ptr[k_elements - 2];
+                            last_1 = ptr[k_elements - 1];
+                        } else if (wstate.kv_cross.k->type == GGML_TYPE_F16) {
+                            const ggml_fp16_t * ptr = (const ggml_fp16_t *)k_layer_data.data();
+                            first_0 = ggml_fp16_to_fp32(ptr[0]);
+                            first_1 = ggml_fp16_to_fp32(ptr[1]);
+                            last_0 = ggml_fp16_to_fp32(ptr[k_elements - 2]);
+                            last_1 = ggml_fp16_to_fp32(ptr[k_elements - 1]);
+                        }
+                    }
+
+                    if (count > 0) {
+                        fprintf(stderr, "[QKV-DBG] Layer %d | Kcross slice elements: %zu | stats: Min = %f, Max = %f, Mean = %f | First 2: %f %f, Last 2: %f %f\n",
+                                il, k_elements, k_min, k_max, k_sum / count, first_0, first_1, last_0, last_1);
+                    }
+                }
+
+                // Read and print stats for Vcross
+                if (wstate.kv_cross.v) {
+                    const int n_ctx_cross = wctx.params.flash_attn ? n_audio_ctx_pad : n_audio_ctx;
+                    size_t v_layer_offset = ggml_element_size(wstate.kv_cross.v) * n_state * n_ctx_cross * il;
+                    size_t size_bytes = ggml_element_size(wstate.kv_cross.v) * n_state * n_ctx_cross;
+                    std::vector<char> v_layer_data(size_bytes);
+                    ggml_backend_tensor_get(wstate.kv_cross.v, v_layer_data.data(), v_layer_offset, size_bytes);
+
+                    double v_min = INFINITY;
+                    double v_max = -INFINITY;
+                    double v_sum = 0.0;
+                    size_t count = 0;
+                    size_t v_elements = n_state * n_ctx_cross;
+
+                    if (wstate.kv_cross.v->type == GGML_TYPE_F32) {
+                        const float * ptr = (const float *)v_layer_data.data();
+                        for (size_t i = 0; i < v_elements; ++i) {
+                            float val = ptr[i];
+                            if (val < v_min) v_min = val;
+                            if (val > v_max) v_max = val;
+                            v_sum += val;
+                            count++;
+                        }
+                    } else if (wstate.kv_cross.v->type == GGML_TYPE_F16) {
+                        const ggml_fp16_t * ptr = (const ggml_fp16_t *)v_layer_data.data();
+                        for (size_t i = 0; i < v_elements; ++i) {
+                            float val = ggml_fp16_to_fp32(ptr[i]);
+                            if (val < v_min) v_min = val;
+                            if (val > v_max) v_max = val;
+                            v_sum += val;
+                            count++;
+                        }
+                    }
+
+                    float first_0 = 0.0f, first_1 = 0.0f;
+                    float last_0 = 0.0f, last_1 = 0.0f;
+                    if (v_elements >= 2) {
+                        if (wstate.kv_cross.v->type == GGML_TYPE_F32) {
+                            const float * ptr = (const float *)v_layer_data.data();
+                            first_0 = ptr[0];
+                            first_1 = ptr[1];
+                            last_0 = ptr[v_elements - 2];
+                            last_1 = ptr[v_elements - 1];
+                        } else if (wstate.kv_cross.v->type == GGML_TYPE_F16) {
+                            const ggml_fp16_t * ptr = (const ggml_fp16_t *)v_layer_data.data();
+                            first_0 = ggml_fp16_to_fp32(ptr[0]);
+                            first_1 = ggml_fp16_to_fp32(ptr[1]);
+                            last_0 = ggml_fp16_to_fp32(ptr[v_elements - 2]);
+                            last_1 = ggml_fp16_to_fp32(ptr[v_elements - 1]);
+                        }
+                    }
+
+                    if (count > 0) {
+                        fprintf(stderr, "[QKV-DBG] Layer %d | Vcross slice elements: %zu | stats: Min = %f, Max = %f, Mean = %f | First 2: %f %f, Last 2: %f %f\n",
+                                il, v_elements, v_min, v_max, v_sum / count, first_0, first_1, last_0, last_1);
+                    }
+                }
+            }
         }
     }
 
@@ -7189,6 +7804,26 @@ int whisper_full_with_state(
                     whisper_compute_logprobs(state->logits, n_logits, logprobs);
                     whisper_compute_probs(state->logits, n_logits, logprobs, probs);
                     state->no_speech_prob = probs[whisper_token_nosp(ctx)];
+
+                    // DEBUG: dump top-5 token IDs and their raw logit values after first decode
+                    // state->logits has n_vocab floats for the last prompt token
+                    // {
+                    //     const float * lg0 = state->logits.data();
+                    //     const int n_lg = (int)state->logits.size();
+
+                    //     // dump all logits to a file, one per line: index value
+                    //     std::ofstream ofs("logits_dump_ov.txt");
+                    //     if (ofs.is_open()) {
+                    //         ofs << std::fixed << std::setprecision(6);
+                    //         for (int k = 0; k < n_lg; ++k) {
+                    //             ofs << k << " " << lg0[k] << "\n";
+                    //         }
+                    //         ofs.close();
+                    //         fprintf(stderr, "[LOGIT_DBG] wrote %d logits to logits_dump.txt\n", n_lg);
+                    //     } else {
+                    //         fprintf(stderr, "[LOGIT_DBG] failed to open logits_dump.txt for writing\n");
+                    //     }
+                    // }
                 }
 
                 {
@@ -7490,6 +8125,25 @@ int whisper_full_with_state(
                         WHISPER_LOG_ERROR("%s: failed to decode\n", __func__);
                         return -9;
                     }
+
+                    // DEBUG: dump top-5 logits for decoder 0 on first two batchd steps
+                    // if (i < 1) {
+                    //     const float * lg0 = state->logits.data();
+                    //     const int n_lg = (int)state->logits.size();
+
+                    //     // dump all logits to a file, one per line: index value
+                    //     std::ofstream ofs("logits_dump.txt");
+                    //     if (ofs.is_open()) {
+                    //         ofs << std::fixed << std::setprecision(6);
+                    //         for (int k = 0; k < n_lg; ++k) {
+                    //             ofs << k << " " << lg0[k] << "\n";
+                    //         }
+                    //         ofs.close();
+                    //         fprintf(stderr, "[LOGIT_DBG] wrote %d logits to logits_dump.txt\n", n_lg);
+                    //     } else {
+                    //         fprintf(stderr, "[LOGIT_DBG] failed to open logits_dump.txt for writing\n");
+                    //     }
+                    // }
 
                     const int64_t t_start_sample_us = ggml_time_us();
 

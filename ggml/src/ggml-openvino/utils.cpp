@@ -414,21 +414,19 @@ ov::Tensor create_ov_output_tensor(const std::shared_ptr<GgmlOvDecoder> & ggml_d
     auto output_type = ggml_decoder->get_ov_type(ggml_tensor);
     ov::Shape output_shape;
     void * output_data = ggml_tensor->data;
-    if (ggml_decoder->is_static()) {
-        output_shape = infer_request->get_output_tensor(output_index).get_shape();
-    } else {
-        // For a CPY into a padded view_src (e.g. a padded KV cache buffer), the
-        // OV ScatterUpdate node outputs the full view_src shape, not the CPY node's
-        // own (smaller) shape.  Using the CPY shape here causes set_output_tensor to
-        // fail with a shape-incompatibility error.  Use view_src's shape and data
-        // pointer instead so the OV tensor matches the model output exactly.
-        if (ggml_tensor->op == GGML_OP_CPY && ggml_tensor->view_src != nullptr &&
-            ggml_nbytes(ggml_tensor) != ggml_nbytes(ggml_tensor->view_src)) {
-            output_shape = GgmlOvDecoder::get_shape(ggml_tensor->view_src);
-            output_data = ggml_tensor->view_src->data;
-        } else {
-            output_shape = GgmlOvDecoder::get_shape(ggml_tensor);
+    bool shape_set = false;
+    try {
+        auto model_output_shape = infer_request->get_output_tensor(output_index).get_shape();
+        if (ov::shape_size(model_output_shape) > 0 &&
+            ov::shape_size(model_output_shape) * output_type.size() <= ggml_nbytes(ggml_tensor)) {
+            output_shape = model_output_shape;
+            shape_set = true;
         }
+    } catch (...) {
+        // Output shape is dynamic or not yet determined
+    }
+    if (!shape_set) {
+        output_shape = GgmlOvDecoder::get_shape(ggml_tensor);
     }
 
     // The sliced path above covers eligible KV outputs. This also covers recurrent state and full-size KV fallbacks.

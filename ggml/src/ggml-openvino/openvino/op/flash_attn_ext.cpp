@@ -64,9 +64,9 @@ static ov::Output<ov::Node> reshape_flat_kv(const ov::Output<ov::Node> & kv_flat
 OutputVector translate_flash_attn_ext(const NodeContext & context) {
     num_inputs_check(context, 3, 4);
     const bool has_mask = context.get_input_size() == 4;
-    auto q_f32 = context.get_input(0);
-    auto k = context.get_input(1);
-    auto v = context.get_input(2);
+    auto q_f32 = process_view_input_new(context, 0);
+    auto k = process_view_input_new(context, 1);
+    auto v = process_view_input_new(context, 2);
     const int op_case = context.get_op_case();
 
     if (op_case == 1 || op_case == 2) {

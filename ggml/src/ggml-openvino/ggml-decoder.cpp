@@ -192,10 +192,33 @@ std::string GgmlOvDecoder::get_tensor_name(const ggml_cgraph * cgraph, const ggm
         if (node != cgraph->nodes + cgraph->n_nodes) {
             return std::string(tensor->name) + "#n" + std::to_string(node - cgraph->nodes);
         }
-        const auto * leaf = std::find(cgraph->leafs, cgraph->leafs + cgraph->n_leafs, tensor);
-        if (leaf != cgraph->leafs + cgraph->n_leafs) {
-            return std::string(tensor->name) + "#l" + std::to_string(leaf - cgraph->leafs);
+        if (cgraph->leafs != nullptr && cgraph->n_leafs > 0) {
+            const auto * leaf = std::find(cgraph->leafs, cgraph->leafs + cgraph->n_leafs, tensor);
+            if (leaf != cgraph->leafs + cgraph->n_leafs) {
+                return std::string(tensor->name) + "#l" + std::to_string(leaf - cgraph->leafs);
+            }
         }
+        // If not found in cgraph->nodes or cgraph->leafs (e.g. cgraph is a ggml_graph_view where n_leafs == 0),
+        // identify the tensor by its first appearance in graph inputs.
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const auto * n = cgraph->nodes[i];
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                const auto * s = n->src[j];
+                if (!s) {
+                    continue;
+                }
+                const auto * base = s;
+                while (base->view_src) {
+                    base = base->view_src;
+                }
+                if (s == tensor || base == tensor) {
+                    return std::string(tensor->name) + "#l" + std::to_string(i * GGML_MAX_SRC + j);
+                }
+            }
+        }
+        const size_t hash_pos = ggml_hash_find(&cgraph->visited_hash_set, tensor);
+        if (hash_pos != GGML_HASHSET_FULL && ggml_bitset_get(cgraph->visited_hash_set.used, hash_pos)) {
+            return std::string(tensor->name) + "#" + std::to_string(hash_pos);        }
     }
     return tensor->name;
 }

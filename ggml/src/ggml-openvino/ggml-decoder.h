@@ -33,6 +33,8 @@ struct ModelParams {
     bool has_rs_rollback = false;
     bool mixed_rope_params = false;
     bool is_cacheless_attn = false;
+    // the graph writes a transposed V cache (`-fa off`: one value element per row, tokens along the row)
+    bool v_trans = false;
     std::vector<int> swa_layers;
     // The sliding-window mask tensor, identified in compute_llm_params() by grouping attention
     // layers on the mask they consume. Only used to tell the two masks apart when naming OV
@@ -47,14 +49,15 @@ struct ModelParams {
                memcmp(rope_params, other.rope_params, sizeof(int32_t) * 16) == 0;
     }
 
+    // swa_layers: the masks and KV write indices of these layers are separate graph inputs
     bool can_reuse_dynamically(const ModelParams & other) const {
-        return same_rope_params(other) && n_rs_slots == other.n_rs_slots &&
-               has_rs_rollback == other.has_rs_rollback;
+        return same_rope_params(other) && n_rs_slots == other.n_rs_slots && has_rs_rollback == other.has_rs_rollback &&
+               swa_layers == other.swa_layers;
     }
 
     bool can_reuse_statically(const ModelParams & other) const {
         return same_rope_params(other) && ctx == other.ctx && n_rs_slots == other.n_rs_slots &&
-               has_rs_rollback == other.has_rs_rollback;
+               has_rs_rollback == other.has_rs_rollback && swa_layers == other.swa_layers;
     }
 
     bool kv_buffer_changed(const ModelParams & other) const { return kv_buffer_ctx_id != other.kv_buffer_ctx_id; }
@@ -66,6 +69,9 @@ struct ComputeParams {
     int attention_size = -1;
     int attention_size_swa = -1;
     int attention_size_static = -1;  // encoder/cross-attn KV fill level (whisper)
+    // OV names of the KQ mask inputs that n_seq_active (mask->ne[3]) and attention_size(_swa) (mask->ne[0]) were read from
+    std::string mask_name;
+    std::string mask_swa_name;
     // Sliding window width, read back from the band of ggml's own SWA mask. ggml never passes
     // n_swa down to a backend, but fill_mask() bakes it into the mask contents, so the widest
     // unmasked row recovers it. Shorter than n_swa while the sequence is still short, which is
@@ -333,6 +339,20 @@ public:
 
     const ggml_tensor * get_tensor_used_op(const ggml_tensor * tensor) const;
 
+    // True if the KV cache is a model input of shape [1, ctx, n_heads_kv, head_size] instead of
+    // [1, 1, ctx, n_heads_kv * head_size]. Used for stateless GPU graphs when the cache holds one sequence, one token
+    // per row, and is only written by SET_ROWS and read through views that split the rows into heads. The GPU
+    // plugin can then fuse the cache write and read into StatelessKV: the new rows are written in place and attention
+    // reads the cache without a copy.
+    bool is_kvcache_4d(const ggml_tensor * cache) const;
+
+    // True if the KV cache is an input of this graph in the 4-D layout (see is_kvcache_4d)
+    bool is_kvcache_4d_input(const ggml_tensor * cache) const { return m_kvcache_4d.count(cache) != 0; }
+
+    // True if each row of the KV cache holds one token. With `-fa off`, llama.cpp keeps the V cache transposed
+    // and writes it one element per row, so its first rows do not hold the first tokens.
+    bool is_kvcache_token_rows(const ggml_tensor * cache) const;
+
     const ggml_tensor * get_tensor_from_name(const std::string & name) const;
 
     void clear_model_weights() { m_model_weights.clear(); }
@@ -499,6 +519,7 @@ private:
     std::set<std::string> m_model_output_names;
     std::vector<NodeInfo> m_node_info_list;
     std::map<ggml_tensor *, int> m_node_dynamic_dims;
+    std::set<const ggml_tensor *> m_kvcache_4d;
 
     ModelParams m_model_params;
     ComputeParams m_compute_params;

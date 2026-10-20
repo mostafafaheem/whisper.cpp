@@ -129,6 +129,7 @@ void ggml_openvino_device_config::init() {
         "GGML_OPENVINO_ENABLE_CACHE",
         "GGML_OPENVINO_DISABLE_CACHE",
         "GGML_OPENVINO_DISABLE_KV_SLICE",
+        "GGML_OPENVINO_ENABLE_KV_4D",
         "GGML_OPENVINO_ENABLE_FALLBACK",
         "GGML_OPENVINO_MANUAL_GQA_ATTN",
         "GGML_OPENVINO_DISABLE_ELTWISE_RANK_ALIGN",
@@ -142,6 +143,7 @@ void ggml_openvino_device_config::init() {
         "GGML_OPENVINO_DISABLE_REMOTE_OUTPUTS",
         "GGML_OPENVINO_REQUANT_KQUANT",
         "GGML_OPENVINO_DISABLE_KV_STATE_RELAYOUT",
+        "GGML_OPENVINO_DISABLE_SHAPE_FROM_MASK",
         // Build the precise (but O(n_nodes)) graph cache key. Needed by op tests.
         "GGML_OPENVINO_FULL_GRAPH_KEY",
     };
@@ -322,6 +324,10 @@ bool ggml_openvino_is_gpu() {
     return has_prefix(ggml_openvino_get_device_name(), "GPU");
 }
 
+bool ggml_openvino_shape_from_mask_enabled() {
+    return ggml_openvino_getenv_int("GGML_OPENVINO_DISABLE_SHAPE_FROM_MASK") == 0;
+}
+
 size_t ggml_openvino_max_alloc_size() {
     return ggml_openvino_get_device_config().max_alloc_size;
 }
@@ -398,6 +404,10 @@ std::optional<ExtraQuantType> ggml_openvino_get_requant_type(const ggml_tensor *
         if (asym64_all) {
             return ExtraQuantType::Q4_1_64;
         }
+    }
+    if (tensor->type == GGML_TYPE_Q5_0) {
+        //return ExtraQuantType::Q4_0_128;
+        return ExtraQuantType::Q4_0_64;
     }
     // MoE expert weights (3D, ne[2] = n_expert) stored as Q5_1/Q8_0 are the expert-side
     // equivalent of Q6_K/Q5_K: kept at 8 bits by default while the rest of the model is at 4
